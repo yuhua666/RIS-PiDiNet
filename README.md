@@ -172,8 +172,8 @@ Download ImageNet-1K pretrained weights for the backbone:
 
 | Model | Download |
 |:------|:--------:|
-| LSKNet-T (backbone) | [Google Drive](https://drive.google.com/file/d/1nH8jcVbFbABEfMtg4eV8yVGKGTCOD63l/view) |
-| LSKNet-S (backbone) | [Google Drive](https://drive.google.com/file/d/1XW_ILTuOqrL07EfZjEGCZqlbFYbTEtxy/view) |
+| LSKNet-T (backbone) |  |
+| LSKNet-S (backbone) |  |
 
 Place the downloaded weights in `pretrained/`.
 
