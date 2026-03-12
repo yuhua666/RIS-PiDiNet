@@ -5,8 +5,6 @@ import torch
 
 from ..builder import ROTATED_DETECTORS, build_backbone, build_head, build_neck
 from .base import RotatedBaseDetector
-
-
 @ROTATED_DETECTORS.register_module()
 class RotatedTwoStageDetector(RotatedBaseDetector):
     """Base class for rotated two-stage detectors.
@@ -63,12 +61,14 @@ class RotatedTwoStageDetector(RotatedBaseDetector):
         return hasattr(self, 'roi_head') and self.roi_head is not None
 
     def extract_feat(self, img):
-        """Directly extract features from the backbone+neck."""
         x = self.backbone(img)
+        
         if self.with_neck:
             x = self.neck(x)
+        #print(f"Feature shape: {x[0].shape if isinstance(x, tuple) else x.shape}")
+        #print(f"Saving feature map to: {save_path}")
         return x
-
+    
     def forward_dummy(self, img):
         """Used for computing network flops.
 
@@ -175,6 +175,9 @@ class RotatedTwoStageDetector(RotatedBaseDetector):
 
         assert self.with_bbox, 'Bbox head must be implemented.'
         x = self.extract_feat(img)
+        #for meta in img_metas:
+            #if 'filename' in meta:
+            #    print("Absolute path of the image:", meta['filename'])
         if proposals is None:
             proposal_list = self.rpn_head.simple_test_rpn(x, img_metas)
         else:
@@ -190,6 +193,9 @@ class RotatedTwoStageDetector(RotatedBaseDetector):
         of imgs[0].
         """
         x = self.extract_feats(imgs)
+        #for meta in img_metas:
+            #if 'filename' in meta:
+            #    print("Absolute path of the image:", meta['filename'])
         proposal_list = self.rpn_head.aug_test_rpn(x, img_metas)
         return self.roi_head.aug_test(
             x, proposal_list, img_metas, rescale=rescale)

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,226 @@ from mmrotate.core import obb2xyxy
 from ..builder import ROTATED_HEADS
 from .rotated_rpn_head import RotatedRPNHead
 
+import os
+import numpy as np
+import torch.nn.functional as F
+
+class PDC(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, dilation=1, groups=1, bias=False, theta=0.7):
+
+        super(PDC, self).__init__() 
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        self.theta = theta
+
+    def forward(self, x):
+        out_normal = self.conv(x)
+
+        if math.fabs(self.theta - 0.0) < 1e-8:
+            return out_normal 
+        else:
+            #pdb.set_trace()
+            [C_out,C_in, kernel_size,kernel_size] = self.conv.weight.shape
+            kernel_diff = self.conv.weight.sum(2).sum(2)
+            kernel_diff = kernel_diff[:, :, None, None]
+            out_diff = F.conv2d(input=x, weight=kernel_diff, bias=self.conv.bias, stride=self.conv.stride, padding=0, groups=self.conv.groups)
+
+            return out_normal - self.theta * out_diff
+    
+class LieGroupRotationPDC(nn.Module):
+    """S-PDC: Symmetry-aware Pixel Difference Convolution (kernel_size=3).
+
+    Modulates PDC weights with a fixed PHT (Polar Harmonic Transform) symmetry
+    kernel H_i^{(n,l)} = cos(2*pi*n*r_i^2 + l*theta_i), scaled by a trainable
+    coefficient alpha, then averages responses over 8 SO(2) rotations.
+
+    Paper eq.:
+        y = alpha * sum_{i != c} w_i * H_i^(n,l) * (x_i - q)  (q absorbed into PDC diff)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=False):
+        super(LieGroupRotationPDC, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        self.theta = 0.7
+        # Trainable harmonic order coefficient alpha_{n,l} (initialised to 1.0)
+        self.alpha = nn.Parameter(torch.ones(1))
+        # Pre-calibrated per-position spectral weights sw_i = target_i / H_i^{(n,l)}
+        # such that H_i * sw_i recovers the centre-surround symmetry kernel exactly
+        self.register_buffer('_pht_spectral_weights', self._precompute_spectral_weights())
+
+    def _precompute_spectral_weights(self):
+        """Offline: solve sw_i = target_i / H_i^{(n=2,l=4)} on the 3x3 grid (k=1).
+
+        H = cos(2*pi*2*r^2 + 4*theta):
+          centre -> cos(0)=1,  edges -> cos(4*pi+4*theta_e)=1,  corners -> cos(8*pi+4*theta_c)=-1
+        sw = target / H:
+          centre->-4, edges->1, corners->0
+        => H * sw = target  (exact recovery of the symmetry kernel)
+        """
+        N = self.kernel_size
+        k = N // 2
+        eps = 1e-6
+        coords = torch.arange(N, dtype=torch.float32) - k
+        grid_v, grid_u = torch.meshgrid(coords, coords)
+        r2 = (grid_u ** 2 + grid_v ** 2) / (k ** 2 + eps)
+        theta = torch.atan2(grid_v, grid_u + eps)
+        H = torch.cos(2.0 * math.pi * 2 * r2 + 4 * theta)   # PHT order (n=2, l=4)
+        target = torch.zeros(N, N)
+        target[k, k]     = -4.0
+        target[k - 1, k] =  1.0
+        target[k + 1, k] =  1.0
+        target[k, k - 1] =  1.0
+        target[k, k + 1] =  1.0
+        sw = torch.where(target != 0, target / H, torch.zeros_like(target))
+        return sw  # [N, N]
+
+    def forward(self, x):
+        weights = self.conv.weight
+        device = x.device
+        weights = weights.to(device)
+
+        # PHT harmonic kernel H_i^{(n,l)}, scaled by trainable alpha_{n,l}
+        pht_kernel = self.create_pht_kernel(x.device)
+        out = self.apply_lie_group_rotation(x, self.alpha * pht_kernel * weights, device, 1)
+
+        [C_out, C_in, kernel_size, kernel_size] = self.conv.weight.shape
+        kernel_diff = self.conv.weight.sum(2).sum(2)
+        kernel_diff = kernel_diff[:, :, None, None]
+        out_diff = self.apply_lie_group_rotation(x, kernel_diff, device, 0)
+
+        output = out - self.theta * out_diff
+
+        return output
+
+    def create_pht_kernel(self, device):
+        """Build the 3x3 PHT harmonic symmetry kernel H_i^{(n,l)}.
+
+        Values are pre-evaluated on the discrete 3x3 grid using the polar
+        harmonic formula:
+            H_i^{(n,l)} = cos(2*pi*n*r_i^2 + l*theta_i)
+        A small epsilon is added for numerical stability, matching
+        Eq. (3-4) in the paper.
+        """
+        N = self.kernel_size
+        k = N // 2
+        eps = 1e-6
+        coords = torch.arange(N, dtype=torch.float32, device=device) - k
+        grid_v, grid_u = torch.meshgrid(coords, coords)
+        r2 = (grid_u ** 2 + grid_v ** 2) / (k ** 2 + eps)
+        theta = torch.atan2(grid_v, grid_u + eps)
+        # H_i^{(n,l)} = cos(2*pi*n*r_i^2 + l*theta_i),  order (n=2, l=4)
+        H = torch.cos(2.0 * math.pi * 2 * r2 + 4 * theta)
+        # Combine with pre-calibrated spectral weights -> target symmetry kernel
+        pht_kernel = H * self._pht_spectral_weights.to(device)
+        pht_kernel = pht_kernel + eps
+        pht_kernel = pht_kernel.unsqueeze(0).unsqueeze(0)
+        pht_kernel = pht_kernel.repeat(self.in_channels, self.in_channels, 1, 1)
+        return pht_kernel
+
+    def apply_lie_group_rotation(self, x, weights, device, pad):
+        rotation_angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+        rotated_weights = []
+        output = []
+
+        for angle in rotation_angles:
+            rotation_matrix = self.rotation_matrix_2d(angle).to(device)
+            rotated_weight = self.rotate_kernel(weights, rotation_matrix, device)
+            rotated_weights.append(rotated_weight)
+
+            output.append(F.conv2d(x, rotated_weight, stride=self.stride, padding=pad, dilation=self.dilation, groups=self.groups))
+
+        return torch.stack(output).mean(0)
+
+    def rotation_matrix_2d(self, angle):
+        return torch.tensor([
+            [torch.cos(torch.tensor(angle)), -torch.sin(torch.tensor(angle))],
+            [torch.sin(torch.tensor(angle)), torch.cos(torch.tensor(angle))]
+        ])
+
+    def rotate_kernel(self, weights, rotation_matrix, device):
+        _, _, kernel_height, kernel_width = weights.shape
+        rotated_kernel = torch.zeros_like(weights)
+
+        for h in range(kernel_height):
+            for w in range(kernel_width):
+                rotated_h = int(h * rotation_matrix[0, 0] + w * rotation_matrix[0, 1])
+                rotated_w = int(h * rotation_matrix[1, 0] + w * rotation_matrix[1, 1])
+
+                if 0 <= rotated_h < kernel_height and 0 <= rotated_w < kernel_width:
+                    rotated_kernel[:, :, rotated_h, rotated_w] = weights[:, :, h, w]
+
+        return rotated_kernel.to(device)
+    
+class LieGroupRotationConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=False):
+        super(LieGroupRotationConv2d, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        #self.theta = 0.7
+
+    def forward(self, x):
+        weights = self.conv.weight
+        device = x.device
+        weights = weights.to(device)
+        
+        output = self.apply_lie_group_rotation(x, weights, device, 2) #1 #9
+        
+        return output
+
+    def create_laplacian_kernel(self, device):
+        laplacian_kernel = torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], dtype=torch.float32, device=device)
+        laplacian_kernel = laplacian_kernel.repeat(self.in_channels, self.in_channels, 1, 1)
+        return laplacian_kernel
+
+    def apply_lie_group_rotation(self, x, weights, device, pad):
+        rotation_angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+        rotated_weights = []
+        output = []
+        
+        for angle in rotation_angles:
+            rotation_matrix = self.rotation_matrix_2d(angle).to(device)
+            rotated_weight = self.rotate_kernel(weights, rotation_matrix, device)
+            rotated_weights.append(rotated_weight)
+            
+            output.append(F.conv2d(x, rotated_weight, stride=self.stride, padding=pad, dilation=self.dilation, groups=self.groups))
+
+        return torch.stack(output).mean(0)
+
+    def rotation_matrix_2d(self, angle):
+        return torch.tensor([
+            [torch.cos(torch.tensor(angle)), -torch.sin(torch.tensor(angle))],
+            [torch.sin(torch.tensor(angle)), torch.cos(torch.tensor(angle))]
+        ])
+
+    def rotate_kernel(self, weights, rotation_matrix, device):
+        _, _, kernel_height, kernel_width = weights.shape
+        rotated_kernel = torch.zeros_like(weights)
+        
+        for h in range(kernel_height):
+            for w in range(kernel_width):
+                rotated_h = int(h * rotation_matrix[0, 0] + w * rotation_matrix[0, 1])
+                rotated_w = int(h * rotation_matrix[1, 0] + w * rotation_matrix[1, 1])
+                
+                if 0 <= rotated_h < kernel_height and 0 <= rotated_w < kernel_width:
+                    rotated_kernel[:, :, rotated_h, rotated_w] = weights[:, :, h, w]
+        
+        return rotated_kernel.to(device)
 
 @ROTATED_HEADS.register_module()
 class OrientedRPNHead(RotatedRPNHead):
@@ -17,7 +238,7 @@ class OrientedRPNHead(RotatedRPNHead):
 
     def _init_layers(self):
         """Initialize layers of the head."""
-        self.rpn_conv = nn.Conv2d(
+        self.rpn_conv = LieGroupRotationPDC(
             self.in_channels, self.feat_channels, 3, padding=1)
         self.rpn_cls = nn.Conv2d(self.feat_channels,
                                  self.num_anchors * self.cls_out_channels, 1)

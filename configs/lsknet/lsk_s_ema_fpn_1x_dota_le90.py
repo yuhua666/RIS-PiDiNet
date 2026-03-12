@@ -14,7 +14,7 @@ model = dict(
         drop_rate=0.1,
         drop_path_rate=0.1,
         depths=[2,2,4,2],
-        init_cfg=dict(type='Pretrained', checkpoint="/data/pretrained/lsk_s_backbone.pth.tar"),
+        init_cfg=dict(type='Pretrained', checkpoint="/root/LSKNet/pretrain/s_checkpoint-100.pth.tar"),
         norm_cfg=dict(type='SyncBN', requires_grad=True)),
     neck=dict(
         type='FPN',
@@ -149,15 +149,15 @@ train_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=2,
+    samples_per_gpu=4, #1
+    workers_per_gpu=4, #2
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
 custom_hooks=[dict(
         type='ExpMomentumEMAHook',
-        total_iter = 8541*12,
+        total_iter = 1600*12, #8541*12,
         priority=49)
     ]
 
