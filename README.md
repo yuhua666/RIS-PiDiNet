@@ -272,7 +272,7 @@ If you find this work useful, please cite:
 ```bibtex
 @inproceedings{rispidiNet_cvpr2026,
   title     = {RIS-PiDiNet: Rotation Invariant Symmetry-Aware Pixel Difference Network for Remote Sensing Object Detection},
-  author    = {Yuhua and others},
+  author    = {Jialei Zhan and others},
   booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
   year      = {2026}
 }
