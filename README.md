@@ -293,3 +293,13 @@ This work builds upon [LSKNet](https://github.com/zcablii/LSKNet) and [MMRotate]
 ## License
 
 This project is released under the [MIT License](LICENSE).
+
+## Cite
+
+@inproceedings{zhan2026rotation,
+  title={Rotation Invariant and Symmetry Aware Pixel Difference Network for Remote Sensing Object Detection},
+  author={Zhan, Jialei and Liu, Li and Zhang, Jiehua and Xie, Yuhang and Liu, Yongxiang and Chen, Jiangming and Cheng, Ming-Ming},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={13264--13274},
+  year={2026}
+}
